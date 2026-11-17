@@ -200,12 +200,14 @@ func (c *Conn) QueryMigrate() (*MigrateStats, error) {
 	return &s, nil
 }
 
-// SetIgnoreShared turns on the migration parameter that skips shared
-// memory-backend regions. Both ends of the migration need it: with it, the
-// stream carries device state only, and guest RAM travels as the
-// memory-backend file itself.
+// SetIgnoreShared turns on the x-ignore-shared migration capability, which
+// skips shared memory-backend regions. Both ends of the migration need it:
+// with it, the stream carries device state only, and guest RAM travels as
+// the memory-backend file itself.
 func (c *Conn) SetIgnoreShared() error {
-	_, err := c.Command("migrate-set-parameters", map[string]any{"ignore-shared": true})
+	_, err := c.Command("migrate-set-capabilities", map[string]any{
+		"capabilities": []map[string]any{{"capability": "x-ignore-shared", "state": true}},
+	})
 	return err
 }
 

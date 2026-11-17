@@ -67,6 +67,7 @@ func main() {
 	loadModules()
 	setupNetwork()
 	go heartbeat()
+	logf("GUEST-READY")
 	listenVsock()
 }
 
@@ -124,11 +125,23 @@ func loadModules() {
 	}
 }
 
+// setupNetwork brings up eth0. The driver attaches the netdev through QMP
+// while the kernel is already booting, so the interface can appear late and
+// is retried for a while.
 func setupNetwork() {
-	link, err := netlink.LinkByName("eth0")
-	if err != nil {
-		logf("NET-ERROR no eth0: %v", err)
-		return
+	deadline := time.Now().Add(30 * time.Second)
+	var err error
+	var link netlink.Link
+	for {
+		link, err = netlink.LinkByName("eth0")
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			logf("NET-ERROR no eth0: %v", err)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	addr, err := netlink.ParseAddr(guestIP)
 	if err != nil {

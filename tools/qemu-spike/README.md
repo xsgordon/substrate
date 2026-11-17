@@ -19,3 +19,19 @@ serves PING and STATE over vsock. A correct restore shows the clock and
 counters continuing from the snapshot; a failed one shows a fresh boot.
 
 Run `go run ./tools/qemu-spike` for the full cycle and a latency report.
+Useful invocations:
+
+	# full matrix, unprivileged (socket netdev stands in for the tap)
+	go run ./tools/qemu-spike -mem 256M,512M,1G,2G -runs 3 -cycles 2 -netdev socket
+
+	# with vhost-vsock (needs the module loaded on the host)
+	sudo modprobe vhost_vsock
+	go run ./tools/qemu-spike -mem 512M -runs 1 -vsock boot
+
+	# tap netdev, the real device path (needs root and CAP_NET_ADMIN)
+	go run ./tools/qemu-spike -mem 512M -runs 1 -netdev tap
+
+Requirements: QEMU with KVM, a kernel whose virtio drivers can be loaded
+from `/lib/modules`, `xz`, and `cp` with sparse support. `vsock boot`
+migrates the vhost-vsock device in the stream; `vsock post` hot-adds it
+after the restore, for the case where its state does not migrate.
