@@ -63,6 +63,18 @@ var maxAssetBytes int64 = 8 << 30
 // single file.
 const gvisorAssetName = "gvisor"
 
+// qemuAssetName is the QEMU backend's tarball asset. A distro QEMU needs its
+// dynamic loader, libraries and firmware next to the binary (the worker
+// image is distroless and stages it under the actor's assets dir), so it
+// travels as an extracted tree: `qemu-kvm` plus `ld-linux-*.so.*`, `lib/`
+// and `pc-bios/`. Its presence in a microvm version's asset set selects the
+// QEMU VMM in place of cloud-hypervisor.
+const qemuAssetName = "qemu"
+
+// qemuAssetBinary is the executable the qemu tarball must contain; the
+// staged path handed to the worker.
+const qemuAssetBinary = "qemu-kvm"
+
 // assetEntry is one content-addressed sandbox asset (url + sha256).
 type assetEntry struct {
 	URL    string `json:"url"`
@@ -148,9 +160,12 @@ func (s *Atelet) stageSandboxAssets(ctx context.Context, rec *sandboxAssetsRecor
 		dst := filepath.Join(dstDir, name)
 		var p string
 		var err error
-		if name == gvisorAssetName {
+		switch name {
+		case gvisorAssetName:
 			p, err = s.stageGVisorRelease(ctx, entry, dst)
-		} else {
+		case qemuAssetName:
+			p, err = s.stageQemuRelease(ctx, entry, dst)
+		default:
 			p, err = s.stageAsset(ctx, entry, dst)
 		}
 		if err != nil {
@@ -253,43 +268,59 @@ func stagedMeanwhile(ctx context.Context, dst string, err error) bool {
 // cache to the directory dst, downloading, verifying and extracting the
 // tarball on a cache miss, and returns the local path of runsc.
 func (s *Atelet) stageGVisorRelease(ctx context.Context, entry assetEntry, dst string) (string, error) {
-	runscPath := filepath.Join(dst, "runsc")
+	return s.stageReleaseAsset(ctx, entry, dst, "gVisor release", "runsc")
+}
+
+// stageQemuRelease links the extracted QEMU backend tree (the qemu-kvm
+// binary with its loader, libraries and firmware) from the cache to the
+// directory dst, downloading, verifying and extracting the tarball on a
+// cache miss, and returns the local path of the binary.
+func (s *Atelet) stageQemuRelease(ctx context.Context, entry assetEntry, dst string) (string, error) {
+	return s.stageReleaseAsset(ctx, entry, dst, "QEMU release", qemuAssetBinary)
+}
+
+// stageReleaseAsset stages an extracted release tree from the cache to the
+// directory dst, downloading, verifying and extracting the tarball on a
+// cache miss, and returns the local path of the binary named want, which
+// the tarball must carry at its top level.
+func (s *Atelet) stageReleaseAsset(ctx context.Context, entry assetEntry, dst, label, want string) (string, error) {
+	binPath := filepath.Join(dst, want)
 	key, err := assetKey(entry)
 	if err != nil {
 		return "", err
 	}
 	if ok, err := staged(ctx, dst); err != nil || ok {
-		return runscPath, err
+		return binPath, err
 	}
 	fetch := func(ctx context.Context, dir string) error {
-		slog.InfoContext(ctx, "gVisor release cache miss; downloading", slog.String("url", entry.displayURL()), slog.String("sha256", entry.SHA256))
+		slog.InfoContext(ctx, label+" cache miss; downloading", slog.String("url", entry.displayURL()), slog.String("sha256", entry.SHA256))
 		tDownload := time.Now()
 		// The tarball is downloaded into the tree it is extracted into and
 		// removed before the cache publishes the tree; on a failure the
 		// cache discards the whole tree, tarball included.
-		tarball := filepath.Join(dir, ".gvisor-release-download")
+		tarball := filepath.Join(dir, ".release-download")
 		if err := s.downloadVerified(ctx, entry, tarball); err != nil {
 			return err
 		}
-		slog.InfoContext(ctx, "gVisor release download complete", slog.String("url", entry.displayURL()), slog.Duration("duration", time.Since(tDownload)))
+		slog.InfoContext(ctx, label+" download complete", slog.String("url", entry.displayURL()), slog.Duration("duration", time.Since(tDownload)))
 
-		slog.InfoContext(ctx, "Extracting gVisor archive", slog.String("url", entry.displayURL()))
+		slog.InfoContext(ctx, "Extracting "+label+" archive", slog.String("url", entry.displayURL()))
 		tExtract := time.Now()
 		// The redacted form ends in the URL path, so a query does not hide the
 		// archive suffix.
 		if err := extractTarArchive(ctx, tarball, entry.displayURL(), dir); err != nil {
 			return err
 		}
-		slog.InfoContext(ctx, "gVisor archive extraction complete", slog.String("url", entry.displayURL()), slog.Duration("duration", time.Since(tExtract)))
-		if fi, err := os.Stat(filepath.Join(dir, "runsc")); err != nil || !fi.Mode().IsRegular() {
-			return fmt.Errorf("gvisor tarball %v contains no runsc binary (stat: %v)", entry.displayURL(), err)
+		slog.InfoContext(ctx, label+" archive extraction complete", slog.String("url", entry.displayURL()), slog.Duration("duration", time.Since(tExtract)))
+		if fi, err := os.Stat(filepath.Join(dir, want)); err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s tarball %v contains no %s binary (stat: %v)", label, entry.displayURL(), want, err)
 		}
 		return os.Remove(tarball)
 	}
 	if err := s.sandboxAssetCache.GetDirTo(ctx, key, dst, fetch); err != nil && !stagedMeanwhile(ctx, dst, err) {
 		return "", err
 	}
-	return runscPath, nil
+	return binPath, nil
 }
 
 // downloadVerified fetches entry.URL into a new file at path, which must not

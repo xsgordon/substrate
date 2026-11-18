@@ -55,6 +55,10 @@ const (
 	// ResourceKVM grants /dev/kvm, which the micro-VM runtime needs to create a
 	// VM (cloud-hypervisor fails with EPERM on VmCreate without it).
 	ResourceKVM = "ate.dev/kvm"
+	// ResourceVhostVsock grants /dev/vhost-vsock, which the QEMU backend's
+	// agent channel needs (its vhost-vsock device opens the node; CLH's
+	// hybrid-vsock used a unix socket instead and needs no grant).
+	ResourceVhostVsock = "ate.dev/vhost-vsock"
 )
 
 // SandboxDevices are the host devices a sandbox runtime needs a grant for.
@@ -65,6 +69,7 @@ const (
 // default allow-list, so the worker gets it as an ordinary bind mount instead.
 var SandboxDevices = []HostDevice{
 	{ResourceName: ResourceKVM, Path: "/dev/kvm"},
+	{ResourceName: ResourceVhostVsock, Path: "/dev/vhost-vsock"},
 }
 
 // HostDevice is a device node advertised to kubelet under ResourceName.

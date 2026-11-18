@@ -495,7 +495,7 @@ func maybeApplyMicroVMPodShape(
 	//
 	// atelet advertises it only on nodes where the device exists, so the
 	// request also keeps the pod off nodes that cannot run a micro-VM.
-	addDeviceResourceLimits(containerAC, deviceplugin.ResourceKVM)
+	addDeviceResourceLimits(containerAC, deviceplugin.ResourceKVM, deviceplugin.ResourceVhostVsock)
 
 	// The runtime also opens /dev/net/tun to build the guest's tap, but that
 	// one needs no grant: it is in the runtime's default device allow-list, so
@@ -515,6 +515,9 @@ func maybeApplyMicroVMPodShape(
 		WithHostPath(corev1ac.HostPathVolumeSource().
 			WithPath(tunDevicePath).
 			WithType(corev1.HostPathCharDev)))
+	// vhost-vsock comes as a device-plugin resource like KVM: the runtime
+	// denies it by default, so a bind mount would carry no allow rule. Only
+	// the QEMU backend opens it; the CLH one never does.
 
 	// Placement onto KVM-capable nodes comes from the device request above: the
 	// scheduler only picks nodes advertising the resource, and atelet advertises
