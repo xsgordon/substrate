@@ -47,7 +47,7 @@ spec:
       object.spec.versions.all(v,
         has(v.assets) && size(v.assets) > 0 &&
         v.assets.all(arch,
-          (['cloud-hypervisor', 'qemu'].any(name, name in v.assets[arch])) &&
+          (('cloud-hypervisor' in v.assets[arch]) || ('qemu' in v.assets[arch])) &&
           ['virtiofsd', 'kata-kernel', 'kata-image']
             .all(name, name in v.assets[arch])))
     message: "a microvm SandboxConfig must define a cloud-hypervisor or qemu asset plus virtiofsd, kata-kernel, and kata-image assets for every architecture of every version under spec.versions[].assets"
