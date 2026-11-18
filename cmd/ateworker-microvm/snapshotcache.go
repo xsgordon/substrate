@@ -21,13 +21,14 @@ import (
 	"log/slog"
 	"strings"
 
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/qvmm"
 	"go.ate.dev/substrate/internal/snapshotcache"
 )
 
 const memoryRangesFile = "memory-ranges"
 
 func isSnapshotDataFile(name string, includeMemory bool) bool {
-	if includeMemory && name == memoryRangesFile {
+	if includeMemory && (name == memoryRangesFile || name == qvmm.RAMFile) {
 		return true
 	}
 	return strings.HasSuffix(name, ".tar")

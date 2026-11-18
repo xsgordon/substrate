@@ -69,6 +69,7 @@ var (
 	podUID       = pflag.String("pod-uid", "", "The UID of the current pod")
 	podIPs       = pflag.String("pod-ips", "", "The comma-separated IPs of the current pod")
 	chBinary     = pflag.String("cloud-hypervisor-binary", "cloud-hypervisor", "Path to the cloud-hypervisor binary (used to relaunch on restore).")
+	qemuBinary   = pflag.String("qemu-binary", "", "Path to the QEMU binary, the alternative VMM backend. A \"qemu\" runtime asset selects it regardless; the flag serves local runs without assets.")
 	guestDebug   = pflag.Bool("guest-debug", false, "enable guest debugging (agent debug logs, debug console, and early serial console)")
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
@@ -238,7 +239,7 @@ func do(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ateworkerService := NewService(*podUID, *chBinary, *guestDebug, *maxActors, tunnel, actorLogger, bootID)
+	ateworkerService := NewService(*podUID, *chBinary, *qemuBinary, *guestDebug, *maxActors, tunnel, actorLogger, bootID)
 	ateworkerService.throttleMemory = cgroup.PSIEnabled(cgroup.Root)
 	if !ateworkerService.throttleMemory {
 		slog.WarnContext(ctx, "Kernel has no cgroup memory pressure (PSI), so actor cgroups get no memory limit and an actor over its booking can restart the worker")
@@ -387,6 +388,7 @@ type AteWorkerService struct {
 
 	podUID     string
 	chBinary   string
+	qemuBinary string
 	guestDebug bool
 
 	// snapshotWrites holds a slot per CH snapshot write in flight, whose page
@@ -420,7 +422,7 @@ type AteWorkerService struct {
 var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
 
 // NewService creates a new AteWorkerService.
-func NewService(podUID, chBinary string, guestDebug bool, maxActors int, tunnel *atunnel.Tunnel, actorLogger *actorlog.ActorLogger, bootID string) *AteWorkerService {
+func NewService(podUID, chBinary, qemuBinary string, guestDebug bool, maxActors int, tunnel *atunnel.Tunnel, actorLogger *actorlog.ActorLogger, bootID string) *AteWorkerService {
 	s := &AteWorkerService{
 		locks:          actorlock.New(),
 		inFlight:       actorlock.NewInFlight(),
@@ -429,6 +431,7 @@ func NewService(podUID, chBinary string, guestDebug bool, maxActors int, tunnel 
 		maxActors:      maxActors,
 		podUID:         podUID,
 		chBinary:       chBinary,
+		qemuBinary:     qemuBinary,
 		guestDebug:     guestDebug,
 		snapshotWrites: make(chan struct{}, snapshotWriteSlots),
 		tunnel:         tunnel,

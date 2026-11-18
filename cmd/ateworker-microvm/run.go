@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/child"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/qvmm"
 	"go.ate.dev/substrate/internal/workerstats"
 
 	"go.ate.dev/substrate/internal/ateworker/actornet"
@@ -107,6 +108,11 @@ type runningActor struct {
 	// closed it.
 	guestAgent *kata.AgentClient
 
+	// isQEMU selects the VMM backend this actor's VM runs under. It comes from
+	// the runtime assets the actor was booted with, so a checkpoint or teardown
+	// that lost the runningActor can recover it from the QMP socket's presence.
+	isQEMU bool
+
 	// workloadIDs are the guest container ids of this actor's workloads, for the
 	// SIGTERM the graceful shutdown propagates into the guest (see shutdown.go).
 	workloadIDs []string
@@ -127,6 +133,7 @@ const baseIDFile = "base-id"
 // fetchRuntimeAssets, keyed by the ActorTemplate runtime asset names).
 const (
 	assetCH        = "cloud-hypervisor"
+	assetQEMU      = "qemu"
 	assetKernel    = "kata-kernel"
 	assetImage     = "kata-image"
 	assetVirtiofsd = "virtiofsd"
@@ -134,6 +141,15 @@ const (
 	// guestImagePmemID names the virtio-pmem device that carries the guest
 	// image, in the VM config and so in every snapshot's config.json.
 	guestImagePmemID = "guest-image"
+
+	// qemuSocketFile is the QMP socket, under the VM dir, for the QEMU
+	// backend. The CLH backend's api-sockets are clh-api.sock (boot) and
+	// clh-api-restore.sock (restore); the QEMU backend uses one name for
+	// both, so a restarted worker can find a running VM's control socket.
+	qemuSocketFile = "qemu.sock"
+	// qvmmRAMFile is the QEMU backend's memory-backend file, under the VM
+	// dir: the actor's private working copy of guest RAM.
+	qvmmRAMFile = "qemu-ram.bin"
 )
 
 // kataAgentPath is where the kata guest image keeps the agent binary. buildVMConfig
@@ -194,8 +210,12 @@ type actorContainer struct {
 // resolvedRuntime holds the concrete binary paths for a request, taken from fetched
 // runtime assets when present, else the process flags.
 type resolvedRuntime struct {
-	chBinary  string // path to the cloud-hypervisor binary
-	virtiofsd string // path to virtiofsd (overlay RO lower); "" => "virtiofsd" on PATH
+	chBinary   string // path to the cloud-hypervisor binary
+	qemuBinary string // path to the QEMU binary
+	virtiofsd  string // path to virtiofsd (overlay RO lower); "" => "virtiofsd" on PATH
+	// qemu selects the QEMU backend. A "qemu" asset decides it outright;
+	// with no assets at all (local runs), a set --qemu-binary flag does.
+	qemu bool
 }
 
 // firstNonEmpty returns the first non-empty string, or "" if all are empty.
@@ -208,12 +228,16 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// resolveRuntime resolves the cloud-hypervisor binary from fetched assets, falling
-// back to the flag.
+// resolveRuntime resolves the VMM binaries from fetched assets, falling back
+// to the flags, and picks the backend.
 func (s *AteWorkerService) resolveRuntime(paths map[string]string) resolvedRuntime {
+	_, hasQEMU := paths[assetQEMU]
+	_, hasCH := paths[assetCH]
 	return resolvedRuntime{
-		chBinary:  firstNonEmpty(paths[assetCH], s.chBinary),
-		virtiofsd: paths[assetVirtiofsd],
+		chBinary:   firstNonEmpty(paths[assetCH], s.chBinary),
+		qemuBinary: firstNonEmpty(paths[assetQEMU], s.qemuBinary),
+		virtiofsd:  paths[assetVirtiofsd],
+		qemu:       hasQEMU || (!hasCH && s.qemuBinary != ""),
 	}
 }
 
@@ -510,76 +534,143 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 		}
 	}()
 
-	// Launch a bare VMM (CH + api-socket); ateworker owns this process for teardown.
-	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api.sock")
-	chProc, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
-		Binary:      rr.chBinary,
-		APISocket:   apiSocket,
-		Stdout:      slogWriter{ctx},
-		Stderr:      slogWriter{ctx},
-		SysProcAttr: leaf.SysProcAttr(),
-	})
-	if err != nil {
-		return fmt.Errorf("while launching VMM: %w", err)
-	}
-	defer func() {
-		if retErr != nil {
-			chProc.Stop()
-		}
-	}()
-
-	// Assemble the CH VmConfig (kata-compatible cmdline, RO kata image on /dev/pmem0 +
-	// the virtio-fs device; no actor virtio-blk disks — rootfs writes land in the
-	// host-side overlay upper through the shared mount). The console log is also read
-	// on a failed agent dial below, so keep it here.
+	// Launch the VMM and boot the actor's micro-VM. The two backends differ
+	// in mechanics, not in shape: CLH boots a bare VMM and drives vm.create,
+	// vm.add-net (tap FDs by SCM_RIGHTS) and vm.boot over its REST api-socket;
+	// QEMU gets its whole device set on the command line, the tap fd
+	// inherited at launch, and runs from the start. Both end with the
+	// kata-agent answering and the containers started over it.
+	//
+	// The console log is read on a failed agent dial below, so keep it here.
 	consoleLog := kata.ConsoleLogPath(actorUID)
-	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, consoleLog, memMiB, vcpus,
-		agentInit(ctx, client.Info()), s.guestDebug)
-	if err := client.CreateVM(ctx, vmCfg); err != nil {
-		return fmt.Errorf("while creating VM: %w", err)
-	}
-
-	// Network device: build the actor's tap and add a virtio-net to the created
-	// (pre-boot) VM with its FDs (SCM_RIGHTS).
-	tapFiles, err := setupActorTap(ctx, s.sandboxNetNS(actorUID), "tap0_kata", 1)
-	if err != nil {
-		return fmt.Errorf("while building tap: %w", err)
-	}
-	defer func() {
-		for _, f := range tapFiles {
-			_ = f.Close() // CH dups adopted FDs; ours always close.
-		}
-	}()
-	var fds []int
-	for _, f := range tapFiles {
-		fds = append(fds, int(f.Fd()))
-	}
-	if err := client.AddNetWithFDs(ctx, actorGuestMAC, 2*len(tapFiles), fds); err != nil {
-		return fmt.Errorf("while adding net device: %w", err)
-	}
-
-	// Boot.
-	if err := client.BootVM(ctx); err != nil {
-		return fmt.Errorf("while booting VM: %w", err)
-	}
-	slog.InfoContext(ctx, "Micro-VM booted", slog.String("id", actorUID), slog.String("api", apiSocket))
-
-	// Dial the kata-agent over hybrid-vsock. The agent only starts listening once
-	// the guest's init reaches kata-containers.target — well after CH creates the
-	// vsock socket file — so poll the CONNECT until it answers (as the kata shim
-	// does), rather than dialing once.
+	var chProc *child.Process
+	var ac *kata.AgentClient
+	var vsockPath string
+	var apiSocket string
 	tBooted := time.Now()
-	vsockPath := kata.VsockSocketPath(actorUID)
-	if !waitForFile(vsockPath, 15*time.Second) {
-		return fmt.Errorf("kata-agent vsock socket %q did not appear", vsockPath)
+	var tVsock, tDialed time.Time
+	if rr.qemu {
+		// The tap exists before launch: QEMU adopts it as the child's fd 3.
+		tapFiles, err := setupActorTap(ctx, s.sandboxNetNS(actorUID), "tap0_kata", 1)
+		if err != nil {
+			return fmt.Errorf("while building tap: %w", err)
+		}
+		defer func() {
+			for _, f := range tapFiles {
+				_ = f.Close()
+			}
+		}()
+		ramFile := filepath.Join(kata.VMDir(actorUID), qvmmRAMFile)
+		if err := qvmm.CreateSparseRAM(ramFile, int64(memMiB)<<20); err != nil {
+			return fmt.Errorf("while creating guest RAM file: %w", err)
+		}
+		vm, err := qvmm.Launch(ctx, qvmm.Options{
+			Binary:      rr.qemuBinary,
+			QMPSocket:   filepath.Join(kata.VMDir(actorUID), qemuSocketFile),
+			MemoryBytes: int64(memMiB) << 20,
+			VCPUs:       vcpus,
+			Kernel:      kernel,
+			Cmdline:     qemuCmdline(kparams, s.guestDebug),
+			GuestImage:  image,
+			RAMFile:     ramFile,
+			VsockCID:    qvmm.CIDFor(actorUID),
+			FsSocket:    kata.VirtiofsdSocketPath(actorUID),
+			FsTag:       kata.FsTag,
+			ConsoleLog:  consoleLog,
+			SerialLog:   serialLogPathIfDebug(s.guestDebug, actorUID),
+			NetMAC:      actorGuestMAC,
+			NetFile:     tapFiles[0],
+			Stdout:      slogWriter{ctx},
+			Stderr:      slogWriter{ctx},
+			SysProcAttr: leaf.SysProcAttr(),
+		})
+		if err != nil {
+			return fmt.Errorf("while launching QEMU: %w", err)
+		}
+		chProc = vm.Proc()
+		apiSocket = filepath.Join(kata.VMDir(actorUID), qemuSocketFile)
+		defer func() {
+			if retErr != nil {
+				vm.Stop()
+			}
+		}()
+		slog.InfoContext(ctx, "Micro-VM booted (qemu)", slog.String("id", actorUID), slog.String("api", apiSocket))
+		tVsock = time.Now()
+		ac, err = dialAgentRetryVsock(ctx, qvmm.CIDFor(actorUID), vm.Proc(), 60*time.Second)
+		if err != nil {
+			logGuestBootDiagnostics(ctx, actorUID, consoleLog)
+			return fmt.Errorf("while dialing kata-agent: %w", err)
+		}
+		tDialed = time.Now()
+	} else {
+		// Launch a bare VMM (CH + api-socket); ateworker owns this process for teardown.
+		apiSocket = filepath.Join(kata.VMDir(actorUID), "clh-api.sock")
+		chProc, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+			Binary:      rr.chBinary,
+			APISocket:   apiSocket,
+			Stdout:      slogWriter{ctx},
+			Stderr:      slogWriter{ctx},
+			SysProcAttr: leaf.SysProcAttr(),
+		})
+		if err != nil {
+			return fmt.Errorf("while launching VMM: %w", err)
+		}
+		defer func() {
+			if retErr != nil {
+				chProc.Stop()
+			}
+		}()
+
+		// Assemble the CH VmConfig (kata-compatible cmdline, RO kata image on /dev/pmem0 +
+		// the virtio-fs device; no actor virtio-blk disks — rootfs writes land in the
+		// host-side overlay upper through the shared mount).
+		vmCfg := buildVMConfig(actorUID, kernel, image, kparams, consoleLog, memMiB, vcpus,
+			agentInit(ctx, client.Info()), s.guestDebug)
+		if err := client.CreateVM(ctx, vmCfg); err != nil {
+			return fmt.Errorf("while creating VM: %w", err)
+		}
+
+		// Network device: build the actor's tap and add a virtio-net to the created
+		// (pre-boot) VM with its FDs (SCM_RIGHTS).
+		tapFiles, err := setupActorTap(ctx, s.sandboxNetNS(actorUID), "tap0_kata", 1)
+		if err != nil {
+			return fmt.Errorf("while building tap: %w", err)
+		}
+		defer func() {
+			for _, f := range tapFiles {
+				_ = f.Close() // CH dups adopted FDs; ours always close.
+			}
+		}()
+		var fds []int
+		for _, f := range tapFiles {
+			fds = append(fds, int(f.Fd()))
+		}
+		if err := client.AddNetWithFDs(ctx, actorGuestMAC, 2*len(tapFiles), fds); err != nil {
+			return fmt.Errorf("while adding net device: %w", err)
+		}
+
+		// Boot.
+		if err := client.BootVM(ctx); err != nil {
+			return fmt.Errorf("while booting VM: %w", err)
+		}
+		slog.InfoContext(ctx, "Micro-VM booted", slog.String("id", actorUID), slog.String("api", apiSocket))
+
+		// Dial the kata-agent over hybrid-vsock. The agent only starts listening once
+		// the guest's init reaches kata-containers.target — well after CH creates the
+		// vsock socket file — so poll the CONNECT until it answers (as the kata shim
+		// does), rather than dialing once.
+		vsockPath = kata.VsockSocketPath(actorUID)
+		if !waitForFile(vsockPath, 15*time.Second) {
+			return fmt.Errorf("kata-agent vsock socket %q did not appear", vsockPath)
+		}
+		tVsock = time.Now()
+		ac, err = dialAgentRetry(ctx, vsockPath, 60*time.Second)
+		if err != nil {
+			logGuestBootDiagnostics(ctx, actorUID, consoleLog)
+			return fmt.Errorf("while dialing kata-agent: %w", err)
+		}
+		tDialed = time.Now()
 	}
-	tVsock := time.Now()
-	ac, err := dialAgentRetry(ctx, vsockPath, 60*time.Second)
-	if err != nil {
-		logGuestBootDiagnostics(ctx, actorUID, consoleLog)
-		return fmt.Errorf("while dialing kata-agent: %w", err)
-	}
-	tDialed := time.Now()
 	// The agent client must stay open past this RPC: the stdout/stderr forwarding
 	// goroutines (started below) read over it for the actor's lifetime. It is stored
 	// on the runningActor and closed by teardownActor. Close it here only if Run
@@ -610,7 +701,7 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 		slog.Duration("wakeup_probe", time.Since(tContainers)),
 		slog.Duration("since_boot", time.Since(tBooted)))
 
-	ra := &runningActor{chProc: chProc, vfsdProc: vfsdProc, apiSocket: apiSocket, memoryBytes: p.size.MemoryBytes, baseID: actorUID, guestAgent: ac, workloadIDs: workloadIDs(ctrs)}
+	ra := &runningActor{chProc: chProc, vfsdProc: vfsdProc, apiSocket: apiSocket, memoryBytes: p.size.MemoryBytes, baseID: actorUID, guestAgent: ac, isQEMU: rr.qemu, workloadIDs: workloadIDs(ctrs)}
 	if err := s.tunnel.ActivateIngress(p.attribution(), s.sandboxDialer(p.actorUID)); err != nil {
 		return err
 	}
@@ -842,6 +933,69 @@ func earlyconParam() string {
 	return "earlycon=uart,io,0x3f8,115200"
 }
 
+// qemuCmdline assembles the guest kernel command line for the QEMU backend:
+// the CLH shape minus the pmem root, since the guest image rides virtio-blk.
+// agentInit is always safe on QEMU: kvm-clock resumes the guest clock exactly
+// across a restore, validated in tools/qemu-spike, so the agent boots as PID 1
+// and no chronyd is kept around to repair the clock.
+func qemuCmdline(kparams string, debug bool) string {
+	cmdline := "root=/dev/vda ro rootfstype=ext4 panic=1 no_timer_check noreplace-smp " +
+		"console=hvc0 swiotlb=noforce " + initParams(true)
+	if kparams != "" {
+		cmdline += " " + kparams
+	}
+	if runtime.GOARCH == "amd64" {
+		cmdline += " clocksource=kvm-clock"
+	}
+	if debug {
+		cmdline += " " + earlyconParam()
+	}
+	return cmdline
+}
+
+// serialLogPathIfDebug returns the guest's early serial log path in debug
+// mode, "" otherwise. QEMU wires it to a -serial file device.
+func serialLogPathIfDebug(debug bool, id string) string {
+	if debug {
+		return kata.SerialLogPath(id)
+	}
+	return ""
+}
+
+// dialAgentRetryVsock polls the QEMU backend's AF_VSOCK agent channel until
+// the kata-agent answers. A guest not listening yet answers ECONNREFUSED
+// right away, so there is no per-attempt timeout; a VMM that exited means
+// the guest died (errGuestStopped), which polling cannot fix.
+func dialAgentRetryVsock(ctx context.Context, cid uint32, proc *child.Process, timeout time.Duration) (*kata.AgentClient, error) {
+	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-proc.Done():
+			return nil, fmt.Errorf("%w (QEMU exited: %s)", errGuestStopped, proc.Exit())
+		default:
+		}
+		ac, err := kata.DialAgentVsock(cid)
+		if err == nil {
+			slog.InfoContext(ctx, "kata-agent answered", slog.Int("attempts", attempt),
+				slog.Duration("elapsed", time.Since(start)))
+			return ac, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-proc.Done():
+			return nil, fmt.Errorf("%w (QEMU exited: %s)", errGuestStopped, proc.Exit())
+		case <-time.After(agentDialInterval):
+		}
+	}
+}
+
 // buildFsConfigs returns the VM's virtio-fs device: the unified share hosting
 // container rootfs trees, durable volumes, CSI volumes, and system-info
 // volumes. Sits on PCI segment 1 (the segment buildVMConfig reserves for
@@ -879,7 +1033,7 @@ func (s *AteWorkerService) startActorContainers(ctx context.Context, ac *kata.Ag
 	err = s.configureGuestNetwork(netCtx, ac, mtu)
 	netCancel()
 	if err != nil {
-		if s.guestDebug {
+		if s.guestDebug && vsockPath != "" {
 			dump := kata.DebugConsoleDump(ctx, vsockPath, "ip addr 2>&1; echo '== route =='; ip route 2>&1; echo '== neigh =='; ip neigh 2>&1")
 			slog.ErrorContext(ctx, "guest network config failed; dump", slog.String("dump", dump))
 		}
@@ -911,7 +1065,7 @@ func (s *AteWorkerService) startRootfsContainer(ctx context.Context, ac *kata.Ag
 	err := ac.StartRootfsContainer(cCtx, c.id, c.spec)
 	cancel()
 	if err != nil {
-		if s.guestDebug {
+		if s.guestDebug && vsockPath != "" {
 			dump := kata.DebugConsoleDump(ctx, vsockPath,
 				"echo '== shared/containers =='; ls -la /run/kata-containers/shared/containers/ 2>&1 | head -40; "+
 					"echo '== rootfs =='; ls /run/kata-containers/shared/containers/"+c.id+"/rootfs/ 2>&1 | head; "+

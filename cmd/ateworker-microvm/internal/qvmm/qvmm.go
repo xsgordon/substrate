@@ -90,6 +90,9 @@ type Options struct {
 	FsSocket, FsTag string
 	// ConsoleLog receives the guest console (virtio-console, hvc0).
 	ConsoleLog string
+	// SerialLog, when set, adds a legacy serial device writing to it, for
+	// the earliest boot messages in debug mode (see earlyconParam).
+	SerialLog string
 	// NetMAC is the guest NIC's MAC; NetFile is its tap, passed to QEMU as
 	// the child's fd 3. The MAC is fixed across an actor's lineage because
 	// a restored guest's ARP cache still holds it.
@@ -168,6 +171,11 @@ func Launch(ctx context.Context, o Options) (*VM, error) {
 		"-device", "virtio-balloon-pci",
 		"-display", "none", "-nodefaults", "-no-reboot",
 		"-qmp", "unix:" + o.QMPSocket + ",server=on,wait=off",
+	}
+	if o.SerialLog != "" {
+		args = append(args, "-serial", "file:"+o.SerialLog)
+	} else {
+		args = append(args, "-serial", "null")
 	}
 	if !o.Incoming {
 		args = append(args, "-kernel", o.Kernel, "-append", o.Cmdline)

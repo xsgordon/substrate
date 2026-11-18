@@ -149,6 +149,21 @@ func (c *Conn) QueryStatus() (string, error) {
 	return s.Status, nil
 }
 
+// CPUCount returns the vCPU count, for recording in a snapshot.
+func (c *Conn) CPUCount() (int, error) {
+	raw, err := c.Command("query-cpus-fast", nil)
+	if err != nil {
+		return 0, err
+	}
+	var cpus []struct {
+		Index int `json:"index"`
+	}
+	if err := json.Unmarshal(raw, &cpus); err != nil {
+		return 0, err
+	}
+	return len(cpus), nil
+}
+
 // MigrateStats is the part of query-migrate the worker reports.
 type MigrateStats struct {
 	Status         string `json:"status"`

@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"go.ate.dev/substrate/internal/apierror"
@@ -30,6 +31,8 @@ import (
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/ch"
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/kata"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/qmp"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/qvmm"
 	"go.ate.dev/substrate/internal/ateworker"
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
 	"go.ate.dev/substrate/internal/ateworker/phaselog"
@@ -149,16 +152,33 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	// waits for the teardown.
 	hosted := s.lookupActor(actorUID)
 
-	// The actor's CH was booted by RunWorkload or relaunched by RestoreWorkload;
-	// either way ateworker owns it and tracks its api-socket.
+	// The actor's VMM was booted by RunWorkload or relaunched by
+	// RestoreWorkload; either way ateworker owns it and tracks its control
+	// socket. A QEMU VM speaks QMP on it, a CLH one its REST API.
 	ra := s.runningVM(actorUID)
-	chSocket := kata.CLHSocketPath(actorUID)
+	isQEMU := ra != nil && ra.isQEMU
+	vmmSocket := kata.CLHSocketPath(actorUID)
 	if ra != nil && ra.apiSocket != "" {
-		chSocket = ra.apiSocket
+		vmmSocket = ra.apiSocket
+	} else if _, err := os.Stat(filepath.Join(kata.VMDir(actorUID), qemuSocketFile)); err == nil {
+		// The worker restarted and lost the runningActor; the QMP socket
+		// on disk says which backend this VM runs under.
+		isQEMU, vmmSocket = true, filepath.Join(kata.VMDir(actorUID), qemuSocketFile)
 	}
-	client := ch.NewClient(chSocket)
-	if _, err := client.WaitReady(ctx, 10*time.Second); err != nil {
-		return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
+	var qc *qmp.Conn
+	var client *ch.Client
+	if isQEMU {
+		var err error
+		qc, err = qmp.Dial(vmmSocket)
+		if err != nil {
+			return nil, fmt.Errorf("while connecting to the VM's QMP socket: %w", err)
+		}
+		defer qc.Close()
+	} else {
+		client = ch.NewClient(vmmSocket)
+		if _, err := client.WaitReady(ctx, 10*time.Second); err != nil {
+			return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
+		}
 	}
 	// Read before the pause: a paused guest cannot answer.
 	if hosted != nil {
@@ -167,7 +187,12 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 
 	tPause := time.Now()
 	dPrep = tPause.Sub(tStart)
-	pauseErr := client.Pause(ctx)
+	var pauseErr error
+	if isQEMU {
+		pauseErr = qc.Stop()
+	} else {
+		pauseErr = client.Pause(ctx)
+	}
 	dPause = time.Since(tPause)
 	if pauseErr != nil {
 		return nil, fmt.Errorf("while pausing guest: %w", pauseErr)
@@ -201,9 +226,13 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	var durableFiles []string
 	g, gctx := errgroup.WithContext(ctx)
 	if scope == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		capture := chCapture(client)
+		if isQEMU {
+			capture = qemuCapture(qc, actorUID)
+		}
 		g.Go(func() error {
 			t := time.Now()
-			d, err := s.snapshotVMState(gctx, client, ra, actorUID, checkpointDir)
+			d, err := s.snapshotVMState(gctx, capture, ra, actorUID, checkpointDir)
 			if err != nil {
 				d = time.Since(t)
 			}
@@ -269,10 +298,41 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	return resp, nil
 }
 
-// snapshotVMState captures the paused guest into checkpointDir: the CH snapshot
-// (config.json + state.json + memory-ranges) plus the base-id the restore side
-// needs, and returns how long the snapshot itself took.
-func (s *AteWorkerService) snapshotVMState(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, checkpointDir string) (time.Duration, error) {
+// snapshotCapture writes the stopped guest's VM state into checkpointDir.
+// It is the VMM-specific half of a snapshot: CH's vm.snapshot (config.json +
+// state.json + memory-ranges), or QEMU's device-state migration stream plus
+// a sparse copy of the memory-backend RAM file.
+type snapshotCapture func(ctx context.Context, checkpointDir string) error
+
+// chCapture captures through CH's REST api-socket.
+func chCapture(client *ch.Client) snapshotCapture {
+	return func(ctx context.Context, dir string) error { return client.Snapshot(ctx, dir) }
+}
+
+// qemuCapture captures through QMP: the device-state migration stream (with
+// x-ignore-shared, so RAM never enters it) and a sparse copy of the
+// memory-backend file, which is the guest's whole RAM. The VM must already
+// be stopped. The vCPU count rides along, because a MEMORY restore must
+// rebuild the exact memory-backend size and topology the snapshot had.
+func qemuCapture(qc *qmp.Conn, actorUID string) snapshotCapture {
+	return func(ctx context.Context, dir string) error {
+		if vcpus, err := qc.CPUCount(); err == nil {
+			if err := os.WriteFile(filepath.Join(dir, qvmm.VcpusFile), []byte(strconv.Itoa(vcpus)), 0o600); err != nil {
+				return err
+			}
+		}
+		ramFile := filepath.Join(kata.VMDir(actorUID), qvmmRAMFile)
+		if err := qvmm.Snapshot(ctx, qc, ramFile, filepath.Join(dir, qvmm.DevstateFile)); err != nil {
+			return err
+		}
+		return qvmm.SparseCopy(ramFile, filepath.Join(dir, qvmm.RAMFile))
+	}
+}
+
+// snapshotVMState captures the paused guest into checkpointDir: the VMM's
+// snapshot (see snapshotCapture) plus the base-id the restore side needs,
+// and returns how long the snapshot itself took.
+func (s *AteWorkerService) snapshotVMState(ctx context.Context, capture snapshotCapture, ra *runningActor, actorUID, checkpointDir string) (time.Duration, error) {
 	// Record the FROZEN base id (the id the guest's virtio-fs find-paths are pinned
 	// to, <baseID>/rootfs). For a cold-run actor this is its own id; for a restored
 	// actor it is the golden id propagated via ra.baseID (set from the snapshot we
@@ -290,7 +350,7 @@ func (s *AteWorkerService) snapshotVMState(ctx context.Context, client *ch.Clien
 
 	slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
 	tSnapshot := time.Now()
-	borrowed, err := s.writeSnapshot(ctx, client, ra, actorUID, checkpointDir)
+	borrowed, err := s.writeSnapshot(ctx, capture, ra, actorUID, checkpointDir)
 	if err != nil {
 		return 0, err
 	}
@@ -337,18 +397,18 @@ const (
 	snapshotWriteSlots    = 2
 )
 
-// writeSnapshot has CH write the paused guest into checkpointDir.
+// writeSnapshot has the VMM write the paused guest into checkpointDir.
 //
-// CH writes through the page cache from the actor's cgroup while the guest
-// still holds its memory. At the worker pod's memory limit that can OOM-kill
-// the whole pod, and every actor on it, so the leaf may only grow into what the
-// actor booked and the guest left untouched, plus what it can borrow, and the
-// kernel throttles CH to the disk past that.
+// The VMM writes through the page cache from the actor's cgroup while the
+// guest still holds its memory. At the worker pod's memory limit that can
+// OOM-kill the whole pod, and every actor on it, so the leaf may only grow
+// into what the actor booked and the guest left untouched, plus what it can
+// borrow, and the kernel throttles the write to the disk past that.
 //
 // It returns what it borrowed, for the caller to Return once the snapshot is on
-// disk. On error the loan comes back once whatever CH wrote is on disk or
+// disk. On error the loan comes back once whatever was written is on disk or
 // removed.
-func (s *AteWorkerService) writeSnapshot(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, checkpointDir string) (int64, error) {
+func (s *AteWorkerService) writeSnapshot(ctx context.Context, capture snapshotCapture, ra *runningActor, actorUID, checkpointDir string) (int64, error) {
 	if s.snapshotWrites != nil {
 		select {
 		case s.snapshotWrites <- struct{}{}:
@@ -390,9 +450,10 @@ func (s *AteWorkerService) writeSnapshot(ctx context.Context, client *ch.Client,
 			defer release()
 		}
 	}
-	if err := client.Snapshot(ctx, checkpointDir); err != nil {
+	captureErr := capture(ctx, checkpointDir)
+	if captureErr != nil {
 		s.writeBackSnapshot(ctx, actorUID, checkpointDir, borrowed)
-		return 0, fmt.Errorf("while snapshotting guest: %w", err)
+		return 0, fmt.Errorf("while snapshotting guest: %w", captureErr)
 	}
 	return borrowed, nil
 }
@@ -401,7 +462,8 @@ func (s *AteWorkerService) writeSnapshot(ctx context.Context, client *ch.Client,
 // are on disk or removed, or right away if there are none.
 func (s *AteWorkerService) writeBackSnapshot(ctx context.Context, actorUID, checkpointDir string, borrowed int64) {
 	var written []string
-	for _, name := range []string{"config.json", "state.json", memoryRangesFile} {
+	// Both backends' snapshot file sets: whichever this dir holds.
+	for _, name := range []string{"config.json", "state.json", memoryRangesFile, qvmm.RAMFile, qvmm.DevstateFile} {
 		p := filepath.Join(checkpointDir, name)
 		if _, err := os.Stat(p); err == nil {
 			written = append(written, p)

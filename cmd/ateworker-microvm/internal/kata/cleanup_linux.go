@@ -140,5 +140,6 @@ func isSandboxProcess(id, cmdline, exe string) bool {
 		return strings.HasPrefix(exe, nodepath.ActorSandboxAssetsDir(id)+"/")
 	}
 	argv0 := strings.SplitN(cmdline, "\x00", 2)[0]
-	return strings.Contains(argv0, "cloud-hypervisor") || strings.Contains(argv0, "virtiofsd")
+	return strings.Contains(argv0, "cloud-hypervisor") || strings.Contains(argv0, "virtiofsd") ||
+		strings.Contains(argv0, "qemu")
 }

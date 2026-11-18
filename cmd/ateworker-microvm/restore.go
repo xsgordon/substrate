@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +37,9 @@ import (
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/ch"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/child"
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/kata"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/qvmm"
 	"go.ate.dev/substrate/internal/ateworkervalidation"
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
@@ -287,9 +290,13 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 
 	// Repoint the snapshot's per-actor paths to this actor's: its VMDir
 	// sockets and files, and the kernel and guest image atelet staged under
-	// this actor's own directory.
-	if err := rewriteSnapshotPaths(restoreDir, actorUID, kernel, image); err != nil {
-		return fmt.Errorf("while rewriting snapshot paths: %w", err)
+	// this actor's own directory. A QEMU snapshot carries no per-VM config
+	// file: its device set is rebuilt from this actor's own staged assets
+	// (see the relaunch below), so there is nothing to rewrite.
+	if !rr.qemu {
+		if err := rewriteSnapshotPaths(restoreDir, actorUID, kernel, image); err != nil {
+			return fmt.Errorf("while rewriting snapshot paths: %w", err)
+		}
 	}
 	srcID := actorUID
 	if b, rerr := os.ReadFile(filepath.Join(restoreDir, baseIDFile)); rerr == nil {
@@ -361,88 +368,182 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	tLowers := time.Now()
 	tDurable := tLowers
 
-	// Networking: rebuild the actor's namespace; the snapshot's virtio-net is
-	// fd-backed, so CH needs fresh tap FDs (net_fds) on restore. The caller
-	// unhosts on failure, once the defers here have stopped the actor's
-	// processes.
-	netDevs, err := ch.SnapshotNetDevices(restoreDir)
-	if err != nil {
-		return fmt.Errorf("while reading snapshot net devices: %w", err)
-	}
-	var restoredNets []ch.RestoredNet
-	var tapFiles []*os.File
-	defer func() {
-		for _, f := range tapFiles {
-			_ = f.Close()
-		}
-	}()
-	for i, nd := range netDevs {
-		files, terr := setupActorTap(ctx, s.sandboxNetNS(actorUID), fmt.Sprintf("tap%d_kata", i), nd.QueuePairs)
+	// Networking and the VMM relaunch differ per backend. Both rebuild the
+	// actor's namespace and tap (the snapshot's virtio-net is fd-backed, so
+	// the new VMM needs fresh tap FDs), and both end with the guest resumed
+	// and its agent answering.
+	var chProc *child.Process
+	var apiSocket string
+	var memMode string
+	var restoreSource string
+	var selfContained bool
+	var tTap, tLaunch, tVMRestore, tResume time.Time
+	var guestAC *kata.AgentClient
+	if rr.qemu {
+		// The QEMU backend's device set is fixed by qvmm.Launch (one tap,
+		// one queue pair, the fixed actor MAC), so there is no snapshot
+		// metadata to read for the net devices.
+		files, terr := setupActorTap(ctx, s.sandboxNetNS(actorUID), "tap0_kata", 1)
 		if terr != nil {
-			return fmt.Errorf("while building restore tap for %s: %w", nd.ID, terr)
+			return fmt.Errorf("while building restore tap: %w", terr)
 		}
-		tapFiles = append(tapFiles, files...)
-		rn := ch.RestoredNet{ID: nd.ID}
-		for _, f := range files {
-			rn.FDs = append(rn.FDs, int(f.Fd()))
-		}
-		restoredNets = append(restoredNets, rn)
-	}
+		defer func() {
+			for _, f := range files {
+				_ = f.Close()
+			}
+		}()
+		tTap = time.Now()
 
-	// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS).
-	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
-	tTap := time.Now()
-	chProc, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
-		Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
-		SysProcAttr: leaf.SysProcAttr(),
-	})
-	if err != nil {
-		return fmt.Errorf("while launching VMM for restore: %w", err)
-	}
-	defer func() {
-		if retErr != nil {
-			chProc.Stop()
+		// Stage the snapshot's RAM image as the actor's private working
+		// copy: QEMU maps it read-write (the running guest's writes land
+		// in it), so the staged snapshot stays pristine for another
+		// restore. The copy is sparse, so it costs the populated extents
+		// only. The image's size is the snapshot's guest RAM, which the
+		// memory-backend must reproduce exactly.
+		ramFile := filepath.Join(kata.VMDir(actorUID), qvmmRAMFile)
+		if err := qvmm.SparseCopy(filepath.Join(restoreDir, qvmm.RAMFile), ramFile); err != nil {
+			return fmt.Errorf("while staging guest RAM: %w", err)
 		}
-	}()
-	// How guest RAM comes back depends on the VMM (see restoreMemMode), and the rest
-	// of the actor's lifecycle follows from that choice:
-	//
-	//   - OnDemand: cloud-hypervisor demand-pages from restoreDir for the VM's whole
-	//     lifetime, so it must stay put, and the snapshot it writes later holds only
-	//     the pages faulted in meanwhile — CheckpointWorkload overlays that delta onto
-	//     this source to rebuild a complete one.
-	//   - Eager: every populated extent is read here and now. Nothing pages from the
-	//     source afterwards and nothing merges against it, so it is dropped below and
-	//     the next snapshot stands on its own.
-	tLaunch := time.Now()
-	memMode := restoreMemMode(ctx, client.Info())
-	slog.InfoContext(ctx, "restoring guest memory",
-		slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
-	if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, memMode); err != nil {
-		return fmt.Errorf("while restoring VM with net FDs: %w", err)
-	}
-	tVMRestore := time.Now()
-	// An eager restore has read the whole snapshot into guest memory, and nothing
-	// merges against it afterwards, so drop the staged memory image and evict its
-	// page cache before resuming the VM so guest RAM and snapshot page cache do
-	// not overlap during Resume and wakeup probe gating.
-	//
-	// When the restore dir is not preserved, dropping ahead of Resume means a
-	// failure after this point costs a re-download of the snapshot on retry.
-	maybeDropStagedMemoryImage(ctx, restoreDir, memMode, preserveRestoreDir)
-	dropActorSnapshotCacheAsync(restoreDir, memMode == ch.MemRestoreEager)
-	if err := client.Resume(ctx); err != nil {
-		return restoreGuestReadyError(ctx, "resuming restored guest", err)
-	}
-	tResume := time.Now()
+		memBytes := int64(0)
+		if fi, err := os.Stat(ramFile); err == nil {
+			memBytes = fi.Size()
+		}
+		vcpus := p.size.VCPUs()
+		if b, err := os.ReadFile(filepath.Join(restoreDir, qvmm.VcpusFile)); err == nil {
+			if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && v > 0 {
+				vcpus = v
+			}
+		}
+		vm, err := qvmm.Launch(ctx, qvmm.Options{
+			Binary:      rr.qemuBinary,
+			QMPSocket:   filepath.Join(kata.VMDir(actorUID), qemuSocketFile),
+			MemoryBytes: memBytes,
+			VCPUs:       vcpus,
+			// Present for the device set; an incoming migration never
+			// boots them.
+			Kernel: kernel, GuestImage: image,
+			RAMFile:  ramFile,
+			VsockCID: qvmm.CIDFor(actorUID),
+			FsSocket: kata.VirtiofsdSocketPath(actorUID), FsTag: kata.FsTag,
+			ConsoleLog: kata.ConsoleLogPath(actorUID),
+			NetMAC:     actorGuestMAC, NetFile: files[0],
+			Incoming: true,
+			Stdout:   slogWriter{ctx}, Stderr: slogWriter{ctx},
+			SysProcAttr: leaf.SysProcAttr(),
+		})
+		if err != nil {
+			return fmt.Errorf("while launching QEMU for restore: %w", err)
+		}
+		chProc = vm.Proc()
+		apiSocket = filepath.Join(kata.VMDir(actorUID), qemuSocketFile)
+		defer func() {
+			if retErr != nil {
+				vm.Stop()
+			}
+		}()
+		tLaunch = time.Now()
+		slog.InfoContext(ctx, "restoring guest memory", slog.String("mode", "qemu-memory-backend"))
+		if err := qvmm.RestoreIncoming(vm.QMP(), filepath.Join(restoreDir, qvmm.DevstateFile)); err != nil {
+			return fmt.Errorf("while restoring VM: %w", err)
+		}
+		tVMRestore = time.Now()
+		// The working copy decouples the VM from restoreDir — pages fault
+		// in from the actor's own file, demand-paged by the host page
+		// cache — so the staged image is spent and every snapshot this
+		// VM writes is self-contained, with no delta to merge.
+		memMode = ch.MemRestoreEager
+		restoreSource, selfContained = "", true
+		maybeDropStagedMemoryImage(ctx, restoreDir, memMode, preserveRestoreDir)
+		dropActorSnapshotCacheAsync(restoreDir, true)
+		if err := vm.QMP().Cont(); err != nil {
+			return restoreGuestReadyError(ctx, "resuming restored guest", err)
+		}
+		tResume = time.Now()
+		guestAC, err = dialAgentRetryVsock(ctx, qvmm.CIDFor(actorUID), vm.Proc(), 15*time.Second)
+		if err != nil {
+			return restoreGuestReadyError(ctx, "dialing kata-agent after resume", err)
+		}
+	} else {
+		netDevs, err := ch.SnapshotNetDevices(restoreDir)
+		if err != nil {
+			return fmt.Errorf("while reading snapshot net devices: %w", err)
+		}
+		var restoredNets []ch.RestoredNet
+		var tapFiles []*os.File
+		defer func() {
+			for _, f := range tapFiles {
+				_ = f.Close()
+			}
+		}()
+		for i, nd := range netDevs {
+			files, terr := setupActorTap(ctx, s.sandboxNetNS(actorUID), fmt.Sprintf("tap%d_kata", i), nd.QueuePairs)
+			if terr != nil {
+				return fmt.Errorf("while building restore tap for %s: %w", nd.ID, terr)
+			}
+			tapFiles = append(tapFiles, files...)
+			rn := ch.RestoredNet{ID: nd.ID}
+			for _, f := range files {
+				rn.FDs = append(rn.FDs, int(f.Fd()))
+			}
+			restoredNets = append(restoredNets, rn)
+		}
 
+		// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS).
+		apiSocket = filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
+		tTap = time.Now()
+		chProc, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+			Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
+			SysProcAttr: leaf.SysProcAttr(),
+		})
+		if err != nil {
+			return fmt.Errorf("while launching VMM for restore: %w", err)
+		}
+		defer func() {
+			if retErr != nil {
+				chProc.Stop()
+			}
+		}()
+		// How guest RAM comes back depends on the VMM (see restoreMemMode), and the rest
+		// of the actor's lifecycle follows from that choice:
+		//
+		//   - OnDemand: cloud-hypervisor demand-pages from restoreDir for the VM's whole
+		//     lifetime, so it must stay put, and the snapshot it writes later holds only
+		//     the pages faulted in meanwhile — CheckpointWorkload overlays that delta onto
+		//     this source to rebuild a complete one.
+		//   - Eager: every populated extent is read here and now. Nothing pages from the
+		//     source afterwards and nothing merges against it, so it is dropped below and
+		//     the next snapshot stands on its own.
+		tLaunch = time.Now()
+		memMode = restoreMemMode(ctx, client.Info())
+		slog.InfoContext(ctx, "restoring guest memory",
+			slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
+		if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, memMode); err != nil {
+			return fmt.Errorf("while restoring VM with net FDs: %w", err)
+		}
+		tVMRestore = time.Now()
+		// An eager restore has read the whole snapshot into guest memory, and nothing
+		// merges against it afterwards, so drop the staged memory image and evict its
+		// page cache before resuming the VM so guest RAM and snapshot page cache do
+		// not overlap during Resume and wakeup probe gating.
+		//
+		// When the restore dir is not preserved, dropping ahead of Resume means a
+		// failure after this point costs a re-download of the snapshot on retry.
+		maybeDropStagedMemoryImage(ctx, restoreDir, memMode, preserveRestoreDir)
+		dropActorSnapshotCacheAsync(restoreDir, memMode == ch.MemRestoreEager)
+		if err := client.Resume(ctx); err != nil {
+			return restoreGuestReadyError(ctx, "resuming restored guest", err)
+		}
+		tResume = time.Now()
+		restoreSource, selfContained = restoreDir, memMode == ch.MemRestoreEager
+
+		guestAC, err = dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
+		if err != nil {
+			return restoreGuestReadyError(ctx, "dialing kata-agent after resume", err)
+		}
+	}
 	// One kata-agent connection serves this whole activation: the CRNG reseed below,
 	// then log forwarding and guest stats. As on cold boot, not reaching the agent
 	// fails the restore. A failing restore closes the connection on its way out.
-	guestAC, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
-	if err != nil {
-		return restoreGuestReadyError(ctx, "dialing kata-agent after resume", err)
-	}
 	defer func() {
 		if retErr != nil {
 			_ = guestAC.Close()
@@ -524,9 +625,10 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 
 	ra := &runningActor{
 		chProc: chProc, vfsdProc: vfsdProc,
-		apiSocket: apiSocket, memoryBytes: p.size.MemoryBytes, baseID: srcID, restoreSourceDir: restoreDir,
+		apiSocket: apiSocket, memoryBytes: p.size.MemoryBytes, baseID: srcID, restoreSourceDir: restoreSource,
 		preserveRestoreSource:   preserveRestoreDir,
-		snapshotIsSelfContained: memMode == ch.MemRestoreEager,
+		snapshotIsSelfContained: selfContained,
+		isQEMU:                  rr.qemu,
 		// Signaling an id the agent does not know fails the whole graceful
 		// shutdown with InvalidContainerId, so these must be what the guest runs.
 		workloadIDs: workloadIDs(ctrs),

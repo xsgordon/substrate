@@ -41,7 +41,7 @@ var _ crashReporter = (*register.CrashReporter)(nil)
 // them down: the actor is torn down here, since the control plane will not
 // reach this worker for it again, and then reported crashed.
 func (s *AteWorkerService) watchVM(attribution resources.ActorAttribution, actorDirs *ateworkerpb.ActorDirs, ra *runningActor) {
-	what, exit := "cloud-hypervisor", ""
+	what, exit := "VMM", ""
 	select {
 	case <-ra.chProc.Done():
 		exit = ra.chProc.Exit()
