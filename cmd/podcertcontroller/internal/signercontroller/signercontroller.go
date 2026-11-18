@@ -23,12 +23,10 @@ import (
 
 	"go.ate.dev/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"go.ate.dev/substrate/cmd/podcertcontroller/internal/rendezvous"
-	"go.ate.dev/substrate/internal/clustertrustbundle"
+	"go.ate.dev/substrate/internal/trustdistribution"
 	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -49,9 +47,12 @@ type Hasher interface {
 type Controller struct {
 	clock clock.PassiveClock
 
-	trustBundles *clustertrustbundle.Client
-	pcrClient    *podcertificate.Client
-	pcrQueue     workqueue.TypedRateLimitingInterface[string]
+	// publish delivers the signer's trust anchors, through the
+	// ClusterTrustBundle API where the cluster serves it and through a
+	// trust-manager Bundle otherwise (see trustdistribution).
+	publish   trustdistribution.Publisher
+	pcrClient *podcertificate.Client
+	pcrQueue  workqueue.TypedRateLimitingInterface[string]
 
 	hasher Hasher
 
@@ -59,14 +60,14 @@ type Controller struct {
 }
 
 // New creates a new Controller.
-func New(clock clock.PassiveClock, handler SignerImpl, hasher Hasher, pcrClient *podcertificate.Client, trustBundles *clustertrustbundle.Client) *Controller {
+func New(clock clock.PassiveClock, handler SignerImpl, hasher Hasher, pcrClient *podcertificate.Client, publish trustdistribution.Publisher) *Controller {
 	sc := &Controller{
-		clock:        clock,
-		trustBundles: trustBundles,
-		pcrClient:    pcrClient,
-		pcrQueue:     workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		handler:      handler,
-		hasher:       hasher,
+		clock:     clock,
+		publish:   publish,
+		pcrClient: pcrClient,
+		pcrQueue:  workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		handler:   handler,
+		hasher:    hasher,
 	}
 
 	sc.pcrClient.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -136,7 +137,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	}
 
 	pcr, err := c.pcrClient.GetCached(namespace, name)
-	if k8serrors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) {
 		c.pcrQueue.Forget(key)
 		return true
 	} else if err != nil {
@@ -219,43 +220,10 @@ func (c *Controller) ensureBundles(ctx context.Context) {
 		return
 	}
 
-	for _, wantCTB := range wantCTBs {
-		ctb, err := c.trustBundles.Get(ctx, wantCTB.ObjectMeta.Name, metav1.GetOptions{})
-		if k8serrors.IsNotFound(err) {
-			_, err = c.trustBundles.Create(ctx, wantCTB, metav1.CreateOptions{})
-			if err != nil {
-				slog.ErrorContext(ctx, "Error while creating ClusterTrustBundle",
-					slog.String("err", err.Error()),
-					slog.String("key", wantCTB.ObjectMeta.Name),
-				)
-				return
-			}
-			return
-		} else if err != nil {
-			slog.ErrorContext(ctx, "Error while getting ClusterTrustBundle",
-				slog.String("err", err.Error()),
-				slog.String("key", wantCTB.ObjectMeta.Name),
-			)
-			return
-		}
-
-		if apiequality.Semantic.DeepEqual(wantCTB.Labels, ctb.Labels) && apiequality.Semantic.DeepEqual(wantCTB.Spec, ctb.Spec) {
-			slog.InfoContext(ctx, "ClusterTrustBundle already in correct state",
-				slog.String("key", wantCTB.ObjectMeta.Name),
-			)
-			continue
-		}
-
-		ctb = ctb.DeepCopy()
-		ctb.ObjectMeta.Labels = wantCTB.Labels
-		ctb.Spec.TrustBundle = wantCTB.Spec.TrustBundle
-
-		_, err = c.trustBundles.Update(ctx, ctb, metav1.UpdateOptions{})
-		if err != nil {
-			slog.ErrorContext(ctx, "Error while updating ClusterTrustBundle",
-				slog.String("err", err.Error()),
-				slog.String("key", wantCTB.ObjectMeta.Name),
-			)
-		}
+	if err := c.publish.Ensure(ctx, wantCTBs); err != nil {
+		slog.ErrorContext(ctx, "Error while publishing trust bundles",
+			slog.String("err", err.Error()),
+			slog.String("signer", c.handler.SignerName()),
+		)
 	}
 }

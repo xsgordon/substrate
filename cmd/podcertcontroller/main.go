@@ -38,12 +38,13 @@ import (
 	"go.ate.dev/substrate/cmd/podcertcontroller/internal/rendezvous"
 	"go.ate.dev/substrate/cmd/podcertcontroller/internal/servicednssigner"
 	"go.ate.dev/substrate/cmd/podcertcontroller/internal/signercontroller"
-	"go.ate.dev/substrate/internal/clustertrustbundle"
 	"go.ate.dev/substrate/internal/installdefaults"
 	"go.ate.dev/substrate/internal/localca"
 	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/trustdistribution"
 	"go.ate.dev/substrate/internal/version"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -162,6 +163,11 @@ func main() {
 		slog.ErrorContext(ctx, "Error creating Kubernetes client", slog.Any("err", err))
 		os.Exit(1)
 	}
+	dyn, err := dynamic.NewForConfig(kconfig)
+	if err != nil {
+		slog.ErrorContext(ctx, "Error creating dynamic Kubernetes client", slog.Any("err", err))
+		os.Exit(1)
+	}
 
 	pcrClient, err := podcertificate.NewClient(kc)
 	if err != nil {
@@ -169,11 +175,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	trustBundles, err := clustertrustbundle.NewClient(kc, nil)
+	// Trust anchors publish through the ClusterTrustBundle API where the
+	// cluster serves it, and through a trust-manager Bundle where it does
+	// not (OpenShift today). A cluster with neither path cannot run.
+	publish, mode, err := trustdistribution.New(kc, dyn)
 	if err != nil {
-		slog.ErrorContext(ctx, "Error discovering ClusterTrustBundle API", slog.Any("err", err))
+		slog.ErrorContext(ctx, "Error discovering a trust bundle publication path", slog.Any("err", err))
 		os.Exit(1)
 	}
+	slog.InfoContext(ctx, "Publishing trust anchors", slog.String("mode", string(mode)))
 
 	hasher := rendezvous.New(
 		kc,
@@ -191,7 +201,7 @@ func main() {
 		slog.ErrorContext(ctx, "Error loading servicedns.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	serviceDNSSignerController := signercontroller.New(clock.RealClock{}, servicednssigner.NewImpl(kc, serviceDNSCAPool, pcrClient), hasher, pcrClient, trustBundles)
+	serviceDNSSignerController := signercontroller.New(clock.RealClock{}, servicednssigner.NewImpl(kc, serviceDNSCAPool, pcrClient), hasher, pcrClient, publish)
 
 	// Create a signer for podidentity.podcert.ate.dev/identity
 	podIdentityCAPool, err := localca.NewRefreshingPool(*podCAPoolFile)
@@ -199,13 +209,13 @@ func main() {
 		slog.ErrorContext(ctx, "Error loading podidentity.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	podIdentitySignerController := signercontroller.New(clock.RealClock{}, podidentitysigner.NewImpl(podIdentityCAPool, pcrClient), hasher, pcrClient, trustBundles)
+	podIdentitySignerController := signercontroller.New(clock.RealClock{}, podidentitysigner.NewImpl(podIdentityCAPool, pcrClient), hasher, pcrClient, publish)
 	postgresCAPool, err := localca.NewRefreshingPool(*postgresCAPoolFile)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error loading PostgreSQL CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	postgresSignerController := signercontroller.New(clock.RealClock{}, postgressigner.NewImpl(*postgresClientNamespace, postgresCAPool, pcrClient), hasher, pcrClient, trustBundles)
+	postgresSignerController := signercontroller.New(clock.RealClock{}, postgressigner.NewImpl(*postgresClientNamespace, postgresCAPool, pcrClient), hasher, pcrClient, publish)
 	go postgresSignerController.Run(ctx, *workersPerSigner)
 	go pcrClient.Informer().Run(ctx.Done())
 	go serviceDNSSignerController.Run(ctx, *workersPerSigner)

@@ -18,11 +18,10 @@ import (
 	"context"
 	"testing"
 
-	"go.ate.dev/substrate/internal/clustertrustbundle"
+	"go.ate.dev/substrate/internal/trustdistribution"
 	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
 )
 
 type fakeSigner struct {
@@ -43,6 +42,22 @@ type assignedHasher struct{}
 
 func (assignedHasher) AssignedToThisReplica(context.Context, string) bool { return true }
 
+type deniedHasher struct{}
+
+func (deniedHasher) AssignedToThisReplica(context.Context, string) bool { return false }
+
+// recordingPublisher records what ensureBundles asked it to publish. The
+// publication mechanics themselves are covered in the trustdistribution
+// package's tests.
+type recordingPublisher struct {
+	got []*certsv1.ClusterTrustBundle
+}
+
+func (p *recordingPublisher) Ensure(_ context.Context, want []*certsv1.ClusterTrustBundle) error {
+	p.got = want
+	return nil
+}
+
 func bundle(trust string, labels map[string]string) *certsv1.ClusterTrustBundle {
 	return &certsv1.ClusterTrustBundle{
 		ObjectMeta: metav1.ObjectMeta{Name: "example.com:signer:bundle", Labels: labels},
@@ -50,59 +65,25 @@ func bundle(trust string, labels map[string]string) *certsv1.ClusterTrustBundle 
 	}
 }
 
-func TestEnsureBundles(t *testing.T) {
-	want := bundle("root-a", map[string]string{"k": "v"})
-	for _, tc := range []struct {
-		name     string
-		existing *certsv1.ClusterTrustBundle
-		wantVerb string // the single write expected, or "" for none
-	}{
-		{name: "missing", wantVerb: "create"},
-		{name: "matching", existing: bundle("root-a", map[string]string{"k": "v"})},
-		{name: "stale bundle", existing: bundle("root-old", map[string]string{"k": "v"}), wantVerb: "update"},
-		{name: "stale labels", existing: bundle("root-a", nil), wantVerb: "update"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			kc := fake.NewSimpleClientset()
-			kc.Resources = []*metav1.APIResourceList{{
-				GroupVersion: certsv1.SchemeGroupVersion.String(),
-				APIResources: []metav1.APIResource{{Name: "clustertrustbundles"}},
-			}}
-			client, err := clustertrustbundle.NewClient(kc, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ctx := context.Background()
-			if tc.existing != nil {
-				if _, err := client.Create(ctx, tc.existing, metav1.CreateOptions{}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			kc.ClearActions()
-
-			c := &Controller{trustBundles: client, hasher: assignedHasher{}, handler: fakeSigner{bundles: []*certsv1.ClusterTrustBundle{want}}}
-			c.ensureBundles(ctx)
-
-			var writes []string
-			for _, a := range kc.Actions() {
-				if v := a.GetVerb(); v == "create" || v == "update" {
-					writes = append(writes, v)
-				}
-			}
-			if tc.wantVerb == "" && len(writes) != 0 {
-				t.Errorf("writes = %v, want none", writes)
-			}
-			if tc.wantVerb != "" && (len(writes) != 1 || writes[0] != tc.wantVerb) {
-				t.Errorf("writes = %v, want [%s]", writes, tc.wantVerb)
-			}
-
-			got, err := client.Get(ctx, want.Name, metav1.GetOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.Spec != want.Spec || got.Labels["k"] != "v" {
-				t.Errorf("stored = %+v, want spec %+v with label k=v", got, want.Spec)
-			}
-		})
+func TestEnsureBundlesPublishes(t *testing.T) {
+	want := []*certsv1.ClusterTrustBundle{bundle("root-a", map[string]string{"k": "v"})}
+	pub := &recordingPublisher{}
+	c := &Controller{publish: pub, hasher: assignedHasher{}, handler: fakeSigner{bundles: want}}
+	c.ensureBundles(context.Background())
+	if len(pub.got) != 1 || pub.got[0].Spec.TrustBundle != "root-a" {
+		t.Errorf("published = %+v, want the signer's desired bundle", pub.got)
 	}
 }
+
+// Only the replica the rendezvous hasher assigns maintains the bundles, so
+// two replicas do not fight over the same objects.
+func TestEnsureBundlesHonorsSharding(t *testing.T) {
+	pub := &recordingPublisher{}
+	c := &Controller{publish: pub, hasher: deniedHasher{}, handler: fakeSigner{bundles: []*certsv1.ClusterTrustBundle{bundle("root-a", nil)}}}
+	c.ensureBundles(context.Background())
+	if len(pub.got) != 0 {
+		t.Errorf("published = %+v, want nothing from an unassigned replica", pub.got)
+	}
+}
+
+var _ trustdistribution.Publisher = (*recordingPublisher)(nil)
