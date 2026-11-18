@@ -137,7 +137,7 @@ func (e *Env) EnsurePodCertificateCAs(ctx context.Context) error {
 // has published all signer bundles.
 func (e *Env) WaitForPodCertificateTrustBundles(ctx context.Context) error {
 	log.Infof("Waiting for podcertificate ClusterTrustBundles to be ready...")
-	err := e.Kube.WaitClusterTrustBundles(ctx, trustBundleNames, e.Cfg.WaitTimeout(TrustBundleTimeout))
+	err := e.Kube.WaitClusterTrustBundles(ctx, trustBundleNames, NamespacePodCert, e.Cfg.WaitTimeout(TrustBundleTimeout))
 	if err != nil {
 		return fmt.Errorf("%w\n%s", err, trustBundleDiagnostics)
 	}

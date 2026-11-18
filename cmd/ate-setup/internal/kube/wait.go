@@ -22,6 +22,7 @@ import (
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 	"go.ate.dev/substrate/internal/clustertrustbundle"
+	"go.ate.dev/substrate/internal/trustdistribution"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -263,24 +264,29 @@ func (c *Client) WaitCondition(ctx context.Context, gvk schema.GroupVersionKind,
 // WaitClusterTrustBundles blocks until the podcertificate controller has
 // published the identity bundles the rest of the install depends on.
 //
+// In ClusterTrustBundle mode it waits for the ClusterTrustBundle objects
+// themselves. In trust-manager mode the controller publishes Bundles
+// instead, and the equivalent readiness is the ConfigMap trust-manager
+// syncs from one appearing in syncNamespace (the podcertificate
+// controller's, which the all-namespace selector covers).
+//
 // The timeout is one deadline shared across every bundle, not a budget per
 // bundle: a slow first one must not hand the second a fresh full timeout.
-func (c *Client) WaitClusterTrustBundles(ctx context.Context, names []string, timeout time.Duration) error {
+func (c *Client) WaitClusterTrustBundles(ctx context.Context, names []string, syncNamespace string, timeout time.Duration) error {
 	defer log.Elapsed(time.Now(), "wait for clustertrustbundles")
+	mode, err := trustdistribution.Detect(c.Typed.Discovery())
+	if err != nil {
+		return fmt.Errorf("discovering the trust bundle publication path: %w", err)
+	}
 	deadline := time.Now().Add(timeout)
 	for _, name := range names {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return fmt.Errorf("waiting for ClusterTrustBundle %s: the %s budget was spent on the bundles before it", name, timeout)
+			return fmt.Errorf("waiting for trust bundle %s: the %s budget was spent on the bundles before it", name, timeout)
 		}
 		var lastErr error
 		err := poll(ctx, remaining, func(ctx context.Context) (bool, error) {
-			gv, err := clustertrustbundle.Discover(c.Typed.Discovery())
-			if err != nil {
-				lastErr = err
-				return false, nil
-			}
-			ok, err := c.Exists(ctx, gv.WithKind("ClusterTrustBundle"), "", name)
+			ok, err := c.trustBundleReady(ctx, mode, syncNamespace, name)
 			if err != nil {
 				lastErr = err
 				return false, nil
@@ -289,12 +295,28 @@ func (c *Client) WaitClusterTrustBundles(ctx context.Context, names []string, ti
 		})
 		if err != nil {
 			if lastErr != nil {
-				return fmt.Errorf("waiting for ClusterTrustBundle %s: %w (last discovery error: %v)", name, err, lastErr)
+				return fmt.Errorf("waiting for trust bundle %s: %w (last readiness error: %v)", name, err, lastErr)
 			}
-			return fmt.Errorf("waiting for ClusterTrustBundle %s: %w", name, err)
+			return fmt.Errorf("waiting for trust bundle %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// trustBundleReady reports whether one published bundle has landed, in
+// whichever form the cluster's mode delivers it.
+func (c *Client) trustBundleReady(ctx context.Context, mode trustdistribution.Mode, syncNamespace, name string) (bool, error) {
+	switch mode {
+	case trustdistribution.ModeClusterTrustBundle:
+		gv, err := clustertrustbundle.Discover(c.Typed.Discovery())
+		if err != nil {
+			return false, err
+		}
+		return c.Exists(ctx, gv.WithKind("ClusterTrustBundle"), "", name)
+	case trustdistribution.ModeTrustManager:
+		return c.Exists(ctx, corev1.SchemeGroupVersion.WithKind("ConfigMap"), syncNamespace, trustdistribution.BundleNameForCTB(name))
+	}
+	return false, fmt.Errorf("unknown trust distribution mode %q", mode)
 }
 
 // WaitDeleted blocks until the named object is no longer present.

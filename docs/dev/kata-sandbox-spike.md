@@ -172,7 +172,29 @@ this class would use.
   loaded (OSC's install provides it), `CAP_NET_ADMIN` in the worker for the
   tap, and SELinux labels that let the worker execute the staged tree.
 
+## OpenShift deployment: the certificate APIs
+
+Deploying the system to OpenShift surfaced a second, independent blocker:
+the podcertificate controller depends on the beta `certificates.k8s.io`
+APIs (ClusterTrustBundle and PodCertificateRequest), which OpenShift does
+not serve — its FeatureGate mechanism maps to `--feature-gates` only, and a
+beta API additionally needs `--runtime-config`, which nothing on OpenShift
+exposes (the kind setup sets both in its kubeadm config; see
+`hack/create-kind-cluster.sh`). Upstream, ClusterTrustBundle went GA in
+Kubernetes 1.37, so a rebase may serve it eventually; nothing in Red Hat's
+tracking commits to that.
+
+Trust distribution now has a fallback: `internal/trustdistribution`
+publishes the signer trust anchors through the ClusterTrustBundle API
+where it is served, and through a trust-manager Bundle (which syncs the
+same PEM into a ConfigMap per namespace) where it is not, failing loudly
+when neither is available. Issuance has no such fallback:
+PodCertificateRequests remain the only path, so a cluster without that
+API cannot run the signers at all. That gap, not trust distribution, is
+what still blocks an OpenShift deploy.
+
 ## Open questions
+
 
 - virtiofsd `find-paths` behavior across `migrate-incoming`, the mechanism
   the whole rootfs restore path depends on. Needs a virtiofsd install; not

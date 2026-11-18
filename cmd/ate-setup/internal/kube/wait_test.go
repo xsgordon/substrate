@@ -175,13 +175,46 @@ func TestWaitClusterTrustBundlesVersions(t *testing.T) {
 				t.Fatal(err)
 			}
 			c := &Client{Typed: kc, Dynamic: dyn, discovery: cached, mapper: restmapper.NewDeferredDiscoveryRESTMapper(cached)}
-			if err := c.WaitClusterTrustBundles(t.Context(), []string{"bundle"}, time.Second); err != nil {
+			if err := c.WaitClusterTrustBundles(t.Context(), []string{"bundle"}, "podcertificate-controller-system", time.Second); err != nil {
 				t.Fatal(err)
 			}
 			if calls != 1 {
 				t.Fatalf("got %d GETs, want 1", calls)
 			}
 		})
+	}
+}
+
+// In trust-manager mode the wait is for the ConfigMap trust-manager syncs
+// from the Bundle, named after it in the sync namespace.
+func TestWaitClusterTrustBundlesTrustManager(t *testing.T) {
+	kc := kubefake.NewSimpleClientset()
+	kc.Resources = []*metav1.APIResourceList{
+		{GroupVersion: "trust.cert-manager.io/v1alpha1",
+			APIResources: []metav1.APIResource{{Name: "bundles", Kind: "Bundle"}}},
+		{GroupVersion: "v1",
+			APIResources: []metav1.APIResource{{Name: "configmaps", Kind: "ConfigMap", Namespaced: true}}},
+	}
+	cached := memory.NewMemCacheClient(kc.Discovery())
+	calls := 0
+	dyn, err := dynamic.NewForConfig(&rest.Config{Host: "https://cluster.test", Transport: bundleRoundTripper(func(req *http.Request) (*http.Response, error) {
+		calls++
+		want := "/api/v1/namespaces/podcertificate-controller-system/configmaps/example.com-signer-bundle"
+		if req.Method != http.MethodGet || req.URL.Path != want {
+			t.Errorf("wrong request: %s %s, want GET %s", req.Method, req.URL.Path, want)
+		}
+		body := `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"example.com-signer-bundle"}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{Typed: kc, Dynamic: dyn, discovery: cached, mapper: restmapper.NewDeferredDiscoveryRESTMapper(cached)}
+	if err := c.WaitClusterTrustBundles(t.Context(), []string{"example.com:signer:bundle"}, "podcertificate-controller-system", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("got %d GETs, want 1", calls)
 	}
 }
 
