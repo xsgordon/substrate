@@ -22,11 +22,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/containerd/ttrpc"
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/third_party/kata/agentpb"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -133,6 +135,50 @@ func (a *AgentClient) Close() error {
 	_ = a.conn.Close()
 	return err
 }
+
+// DialAgentVsock connects to the kata-agent over the QEMU backend's
+// vhost-vsock channel: AF_VSOCK to the guest's CID on the agent port. The
+// guest side is identical to the hybrid-vsock path (the agent listens on
+// the port); only the host transport differs, since QEMU has no per-VM
+// unix socket for it. A guest that is not listening yet answers with
+// ECONNREFUSED, which the caller's retry loop treats as "keep polling".
+func DialAgentVsock(cid uint32) (*AgentClient, error) {
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("vsock socket: %w", err)
+	}
+	if err := unix.Connect(fd, &unix.SockaddrVM{CID: cid, Port: agentVsockPort}); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("dialing vsock cid %d: %w", cid, err)
+	}
+	conn := vsockConn{f: os.NewFile(uintptr(fd), "vsock"), cid: cid}
+	return &AgentClient{conn: conn, client: ttrpc.NewClient(conn)}, nil
+}
+
+// vsockConn adapts a connected AF_VSOCK socket to net.Conn for ttrpc. The
+// deadlines forward to the file, which is pollable like any socket.
+type vsockConn struct {
+	f   *os.File
+	cid uint32
+}
+
+func (c vsockConn) Read(b []byte) (int, error)    { return c.f.Read(b) }
+func (c vsockConn) Write(b []byte) (int, error)   { return c.f.Write(b) }
+func (c vsockConn) Close() error                  { return c.f.Close() }
+func (c vsockConn) SetDeadline(t time.Time) error { return c.f.SetDeadline(t) }
+func (c vsockConn) SetReadDeadline(t time.Time) error {
+	return c.f.SetReadDeadline(t)
+}
+func (c vsockConn) SetWriteDeadline(t time.Time) error {
+	return c.f.SetWriteDeadline(t)
+}
+func (c vsockConn) LocalAddr() net.Addr  { return vsockAddr{cid: unix.VMADDR_CID_HOST} }
+func (c vsockConn) RemoteAddr() net.Addr { return vsockAddr{cid: c.cid} }
+
+type vsockAddr struct{ cid uint32 }
+
+func (a vsockAddr) Network() string { return "vsock" }
+func (a vsockAddr) String() string  { return fmt.Sprintf("vsock:%d", a.cid) }
 
 // CreateContainer asks the agent to create a container: mount its storages (in
 // order) and build the rootfs, then fork the parked init process. This is the
