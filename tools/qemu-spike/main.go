@@ -182,17 +182,38 @@ func runCycle(name, mem, kernel, initramfs, vsockMode, netdevMode string) (repor
 		}
 	}
 
-	stateBefore, err := vsockRoundtrip(cid, vsockMode == "boot", "STATE")
-	if err != nil {
-		row.addError("vsock before snapshot: %v", err)
-	} else {
-		row.VsockOK = true
+	// lastState carries the guest's vsock counters from one observation to
+	// the next; a restore that continues RAM produces strictly larger ones.
+	var lastState guestState
+	if vsockMode == "boot" {
+		sv, err := vsockState(cid)
+		if err != nil {
+			row.addError("vsock before snapshot: %v", err)
+		} else {
+			lastState, row.VsockOK = sv, true
+		}
 	}
+	// vsockAttached tracks the post-mode hot-added device, which is
+	// unplugged again before each snapshot.
+	vsockAttached := false
 
 	for cycle := 1; cycle <= *flagCycles; cycle++ {
 		// The cycle's source is the previous cycle's restored VM.
 		devstate := filepath.Join(dir, fmt.Sprintf("devstate-c%d.bin", cycle))
 		lastHB := lastHeartbeat(src.consolePath)
+
+		// vhost-vsock state does not survive being migrated twice: the
+		// second restore trips a vhost virtqueue index inconsistency and
+		// the guest misses the transport reset. In post mode the device
+		// therefore travels outside the stream, unplugged for the
+		// snapshot and re-attached after the restore.
+		if vsockAttached {
+			if err := detachVsock(src); err != nil {
+				src.kill()
+				return row, fmt.Errorf("vsock detach cycle %d: %w", cycle, err)
+			}
+			vsockAttached = false
+		}
 
 		start := time.Now()
 		stats, err := snapshotVM(src, devstate)
@@ -207,7 +228,12 @@ func runCycle(name, mem, kernel, initramfs, vsockMode, netdevMode string) (repor
 		start = time.Now()
 		restoreRam := filepath.Join(dir, fmt.Sprintf("ram-restore-c%d.bin", cycle))
 		restoreState := filepath.Join(dir, fmt.Sprintf("devstate-restore-c%d.bin", cycle))
-		for _, cp := range [][2]string{{ram, restoreRam}, {devstate, restoreState}} {
+		// Stage the CURRENT VM's RAM file: after the first cycle the
+		// running VM's backend is the previous restore's staged copy, not
+		// the original ram.bin. Stale RAM under a fresh device-state
+		// stream produces exactly the virtqueue chaos a broken restore
+		// would.
+		for _, cp := range [][2]string{{src.cfg.ramPath, restoreRam}, {devstate, restoreState}} {
 			// Sparse copy keeps holes in the RAM image, the way the
 			// object store would ship only populated regions.
 			if out, err := exec.Command("cp", "--sparse=always", cp[0], cp[1]).CombinedOutput(); err != nil {
@@ -255,12 +281,14 @@ func runCycle(name, mem, kernel, initramfs, vsockMode, netdevMode string) (repor
 
 		if vsockMode == "post" {
 			if err := hotAddVsock(dst, cid); err != nil {
-				row.addError("hot-add vsock cycle %d: %v", cycle, err)
+				dst.kill()
+				return row, fmt.Errorf("hot-add vsock cycle %d: %w", cycle, err)
 			}
+			vsockAttached = true
 		}
 		if vsockMode != "off" {
 			start = time.Now()
-			reply, err := vsockRoundtrip(cid, true, "STATE")
+			sv, err := vsockState(cid)
 			if err != nil {
 				row.addError("vsock after restore cycle %d: %v", cycle, err)
 				dst.kill()
@@ -268,14 +296,18 @@ func runCycle(name, mem, kernel, initramfs, vsockMode, netdevMode string) (repor
 			}
 			row.PongMS = time.Since(start).Milliseconds()
 			row.VsockOK = true
-			// The counter must have advanced past the pre-snapshot value:
-			// the connection counter lives only in guest RAM.
-			if stateBefore != "" && reply == stateBefore {
-				row.StateKept = false
-				row.addError("state counter reset after restore cycle %d", cycle)
+			// The counters live only in guest RAM, so a restore that
+			// brought RAM back produces strictly larger ones.
+			if lastState.ok {
+				row.StateKept = sv.served > lastState.served && sv.ms > lastState.ms
+				if !row.StateKept {
+					row.addError("guest state reset after restore cycle %d: %s", cycle, sv.raw)
+				}
 			} else {
-				row.StateKept = true
+				// No earlier observation to compare against.
+				row.StateKept = row.BootToHBMS > 0
 			}
+			lastState = sv
 		} else {
 			// Without vsock, continuity rides on the heartbeat alone.
 			row.StateKept = row.BootToHBMS > 0
@@ -516,6 +548,9 @@ func attachNetdevOne(v *vm, mode string) error {
 	_, err := v.qmp.Command("device_add", map[string]any{
 		"driver": "virtio-net-pci", "id": "nic0", "netdev": "net0",
 		"mac": guestMAC, "bus": "rp-net",
+		// No guest PXE or EFI boots from this NIC, so skip the option
+		// ROM: it is another firmware blob the asset would have to ship.
+		"romfile": "",
 	})
 	return err
 }
@@ -552,9 +587,39 @@ func pingGuest() error {
 	return nil
 }
 
+// guestState is the guest's answer to STATE: the vsock connection counter
+// and the monotonic clock, both of which live only in guest RAM.
+type guestState struct {
+	served int64
+	ms     int64
+	ok     bool
+	raw    string
+}
+
+// vsockState dials the guest on its CID and reads its STATE reply.
+func vsockState(cid uint32) (guestState, error) {
+	line, err := vsockRoundtrip(cid, "STATE")
+	if err != nil {
+		return guestState{}, err
+	}
+	var sv guestState
+	sv.raw = line
+	fields := strings.Fields(line)
+	if len(fields) == 3 && fields[0] == "STATE" {
+		if s, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+			if m, err := strconv.ParseInt(fields[2], 10, 64); err == nil {
+				sv.served, sv.ms, sv.ok = s, m, true
+			}
+		}
+	}
+	if !sv.ok {
+		return sv, fmt.Errorf("bad STATE reply %q", line)
+	}
+	return sv, nil
+}
+
 // vsockRoundtrip dials the guest on its CID and returns its reply line.
-// guestAttached says whether the vsock device is expected to be present.
-func vsockRoundtrip(cid uint32, guestAttached bool, request string) (string, error) {
+func vsockRoundtrip(cid uint32, request string) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
@@ -579,10 +644,16 @@ func vsockRoundtrip(cid uint32, guestAttached bool, request string) (string, err
 		}
 		return strings.TrimSpace(line), nil
 	}
-	if !guestAttached {
-		return "", fmt.Errorf("no vsock device: %v", lastErr)
-	}
 	return "", lastErr
+}
+
+// detachVsock unplugs the hot-added vsock device so the snapshot's
+// migration stream does not carry its state.
+func detachVsock(v *vm) error {
+	if _, err := v.qmp.Command("device_del", map[string]any{"id": "vsock0"}); err != nil {
+		return err
+	}
+	return v.qmp.WaitDeviceDeleted(10 * time.Second)
 }
 
 func vhostVsockAvailable() bool {

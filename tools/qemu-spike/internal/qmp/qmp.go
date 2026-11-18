@@ -33,6 +33,9 @@ type Conn struct {
 	conn *net.UnixConn
 	r    *bufio.Reader
 	id   int
+	// events holds async events read while waiting for command results,
+	// so an event that arrives early is not lost to a later Wait call.
+	events []string
 }
 
 // Dial connects to the QMP socket, reads the greeting and negotiates
@@ -105,6 +108,7 @@ func (c *Conn) GetFD(fdname string, fd int) error {
 }
 
 // readResult reads messages until the reply with the wanted id arrives.
+// Async events seen on the way are buffered.
 func (c *Conn) readResult(id int) (json.RawMessage, error) {
 	for {
 		var msg struct {
@@ -113,10 +117,15 @@ func (c *Conn) readResult(id int) (json.RawMessage, error) {
 				Class string `json:"class"`
 				Desc  string `json:"desc"`
 			} `json:"error"`
-			ID int `json:"id"`
+			ID    int    `json:"id"`
+			Event string `json:"event"`
 		}
 		if err := c.readMsg(&msg, id); err != nil {
 			return nil, err
+		}
+		if msg.Event != "" {
+			c.events = append(c.events, msg.Event)
+			continue
 		}
 		if msg.ID != id {
 			continue
@@ -125,6 +134,39 @@ func (c *Conn) readResult(id int) (json.RawMessage, error) {
 			return nil, fmt.Errorf("qmp %s: %s", msg.Error.Class, msg.Error.Desc)
 		}
 		return msg.Return, nil
+	}
+}
+
+// WaitDeviceDeleted waits for the DEVICE_DELETED event of an earlier
+// device_del. The event can arrive while the command result is still being
+// read, so it is buffered and this call may be satisfied immediately.
+func (c *Conn) WaitDeviceDeleted(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		for i, e := range c.events {
+			if e == "DEVICE_DELETED" {
+				c.events = append(c.events[:i], c.events[i+1:]...)
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("DEVICE_DELETED not seen within %v", timeout)
+		}
+		var msg struct {
+			Event string `json:"event"`
+		}
+		c.conn.SetReadDeadline(deadline)
+		err := c.readMsg(&msg, 0)
+		c.conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			return err
+		}
+		if msg.Event == "DEVICE_DELETED" {
+			return nil
+		}
+		if msg.Event != "" {
+			c.events = append(c.events, msg.Event)
+		}
 	}
 }
 
