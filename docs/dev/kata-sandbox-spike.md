@@ -66,6 +66,22 @@ snapshot and restore cycles per run, with the tap netdev and vsock attached:
   cycle results, with the first vsock round trip after restore at 404ms
   including the attach.
 
+### Against the OSC payload itself
+
+After installing the `sandboxed-containers-operator` (v1.13.1,
+kata-containers 3.31.0) on that node and creating a cluster `KataConfig`,
+which applied the payload MachineConfig and rebooted the node, the same
+three-cycle run passed against the payload's own components: QEMU from
+`/usr/libexec/qemu-kvm` (qemu-kvm 10.1.0) and the kernel the `kata`
+runtime class itself uses, which on this payload is the node's own 5.14
+vmlinuz with an osbuilder initrd. Snapshot 14ms, stream 396KB, incoming
+23ms, vsock round trip after restore 34ms, counters and clock continuing
+across all three restores (heartbeats 1065, 2058, 3067ms), tap reachable
+every cycle. A pod scheduled with the `kata` RuntimeClass also ran
+normally on the same node, so the install is functional on both
+consumption paths: the supported RuntimeClass one and the direct drive
+this class would use.
+
 ## Findings
 
 1. **The snapshot mechanism works, repeatedly, on both kernels.**
@@ -114,10 +130,20 @@ snapshot and restore cycles per run, with the tap netdev and vsock attached:
    directory's labels, or the worker SCC's `seLinuxOptions`, must make the
    staged tree executable.
 
-7. **The RHCOS node has no QEMU or Kata packages.** The class cannot use
-   distro QEMU; it consumes the OSC payload or ships its own. `/dev/vhost-vsock`
-   exists on the node but the `vhost_vsock` module is not loaded until
-   something loads it, which the OSC payload does.
+7. **The OSC payload provides the whole stack at fixed node paths, and its
+   default guest kernel is the node's own.** The install puts
+   `qemu-kvm` 10.1.0 at `/usr/libexec/qemu-kvm`, virtiofsd at
+   `/usr/libexec/virtiofsd`, and kata-containers 3.31.0 under
+   `/usr/libexec/kata-containers`, with the configuration in
+   `/etc/kata-containers/configuration.toml`. The `kata` runtime class
+   boots the node's own kernel through an osbuilder initrd
+   (`kata.kernel` symlinks to `/lib/modules/$(uname -r)/vmlinuz`); only
+   the confidential-computing variants carry a separate RHEL 10 (6.12)
+   kernel. A class consuming the payload therefore pins its guest kernel
+   to the node's, which simplifies compatibility attributes but ties
+   snapshot compatibility to node upgrades. The `vhost_vsock` module is
+   not loaded by the install and has no modules-load entry; the class must
+   load it itself, as the spike did.
 
 8. **vsock needs per-node CID allocation.** QEMU's vhost-vsock shares one
    host-wide CID space, where Cloud Hypervisor's hybrid-vsock used a unix
@@ -151,14 +177,14 @@ snapshot and restore cycles per run, with the tap netdev and vsock attached:
 - virtiofsd `find-paths` behavior across `migrate-incoming`, the mechanism
   the whole rootfs restore path depends on. Needs a virtiofsd install; not
   covered by this spike.
-- The kata-agent protocol version the OSC payload ships versus the
-  `agentpb` the worker would drive, and the OSC payload's exact paths and
-  kernel version on a cluster with a `KataConfig` (the inspection script
-  is ready; the lab node has no OSC install).
+- The kata-agent protocol version the OSC payload ships (3.31.0) versus
+  the `agentpb` the worker would drive, which the microvm class vendors
+  from kata 4.3.1. The payload paths and versions are now cataloged; the
+  agent protocol check remains.
 - A rootful `spc_t` SELinux rerun.
 - Delta snapshots: the RAM file grows by dirty pages only, but identifying
   them needs KVM dirty-ring tracking; the baseline ships the full sparse
   image, which the object store path already tolerates.
-- These results are for the node's distro kernel as guest. The OSC
-  payload's kernel is a separate build and should be re-validated with the
-  same harness in Phase 3.
+- The OSC payload's confidential-computing kernel (RHEL 10, 6.12) is a
+  separate build from the default one and was not exercised; only the
+  default class, whose guest kernel is the node's, was validated.
